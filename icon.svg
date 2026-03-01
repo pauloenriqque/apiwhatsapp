@@ -1,0 +1,5 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <!-- Casa -->
+  <path d="M8 30 L32 10 L56 30 V54 A2 2 0 0 1 54 56 H38 A2 2 0 0 1 36 54 V40 H28 V54 A2 2 0 0 1 26 56 H10 A2 2 0 0 1 8 54 Z"
+        fill="#1E90FF" stroke="#1E90FF" stroke-width="2"/>
+</svg>
