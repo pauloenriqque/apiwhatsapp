@@ -6,13 +6,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const QRCode = require('qrcode'); // para gerar SVG no endpoint /qr
 
-let qrcode = null;
-try {
-  qrcode = require('qrcode-terminal');
-} catch (_) {
-  // opcional: instale com `npm i qrcode-terminal` para ver QR no terminal
-}
+let qrcodeTerm = null;
+try { qrcodeTerm = require('qrcode-terminal'); } catch (_) {}
 
 const PORT = process.env.PORT || 8000;
 
@@ -20,35 +17,59 @@ const PORT = process.env.PORT || 8000;
 let isReady = false;
 let lastState = null;
 let lastAuthAt = null;
+let lastQR = null;         // QR atual (texto)
+let lastQRAt = null;       // quando recebemos o QR
+let loadingScreen = null;  // progresso do loading
 
 // ----------------- WhatsApp Web JS (Puppeteer) -----------------
-// Não definimos `executablePath` aqui.
-// O Puppeteer encontra o Chrome baixado no build (postinstall) e salvo em ./.cache/puppeteer
+// Não definimos `executablePath`: o Puppeteer usa o Chrome baixado no build e salvo em ./.cache/puppeteer
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' }),
   puppeteer: {
     headless: 'new',
-    // Flags recomendadas em ambientes conteinerizados/headless
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--no-zygote',
-      '--single-process'
+      '--single-process',
+      '--window-size=1280,800',
+      '--disable-features=TranslateUI',
+      '--hide-scrollbars'
     ]
   }
 });
 
+// ====== Eventos p/ diagnóstico ======
+client.on('loading_screen', (percent, msg) => {
+  loadingScreen = { percent, msg, at: new Date() };
+  console.log('[loading_screen]', percent, msg);
+});
+
 client.on('qr', (qr) => {
-  console.log('QR RECEIVED');
-  if (qrcode) qrcode.generate(qr, { small: true });
-  else console.log(qr);
+  lastQR = qr;
+  lastQRAt = new Date();
+  console.log('QR RECEIVED', `(at ${lastQRAt.toISOString()})`);
+  if (qrcodeTerm) qrcodeTerm.generate(qr, { small: true });
 });
 
 client.on('authenticated', () => {
   lastAuthAt = new Date();
-  console.log('₢ BOT-ZDG Autenticado');
+  console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
+  // limpamos o QR armazenado para evitar expor QR antigo
+  lastQR = null;
+  lastQRAt = null;
+});
+
+client.on('auth_failure', (m) => {
+  console.error('[auth_failure]', m);
+  // se falhar auth, em geral o fluxo volta a exibir QR
+});
+
+client.on('change_state', (state) => {
+  lastState = state;
+  console.log('[change_state]', state);
 });
 
 client.on('ready', async () => {
@@ -57,43 +78,75 @@ client.on('ready', async () => {
   try {
     lastState = await client.getState();
     console.log('getState() após ready:', lastState);
-  } catch (_) {}
+  } catch (e) {
+    console.warn('getState() falhou após ready:', e?.message || String(e));
+  }
 });
 
-client.on('auth_failure', (m) => console.error('[auth_failure]', m));
 client.on('disconnected', (reason) => {
   isReady = false;
   console.warn('[disconnected]', reason);
 });
 
+// Inicia o cliente
 client.initialize();
 
 // ----------------- Express App -----------------
 const app = express();
 
+// Health-check minimalista (HEAD/GET)
+app.head('/', (_req, res) => res.status(200).end());
+app.get('/healthz', (_req, res) => res.json({ ok: true, isReady, lastState, loadingScreen }));
+
 // Log simples de requests
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
+app.use((req, _res, next) => {
+  // Evita poluir muito os logs com health-checks
+  if (req.path !== '/healthz') {
+    console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
+  }
   next();
 });
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res
     .type('text/plain; charset=utf-8')
     .send(`App running on *:${PORT}\nBOT-ZDG: ${isReady ? 'ready' : 'initializing'}\n`);
 });
 
-app.get('/status', async (req, res) => {
+// Novo: exibe o QR atual como SVG no navegador
+app.get('/qr', async (_req, res) => {
+  try {
+    if (!lastQR) {
+      return res
+        .status(404)
+        .type('text/plain; charset=utf-8')
+        .send('QR ainda não disponível. Tente novamente em alguns segundos.');
+    }
+    const svg = await QRCode.toString(lastQR, { type: 'svg', errorCorrectionLevel: 'M' });
+    res.type('image/svg+xml').send(svg);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Status completo
+app.get('/status', async (_req, res) => {
   let state = null;
   try { state = await client.getState(); } catch (_) {}
-  res.json({ ok: true, isReady, state, authenticatedAt: lastAuthAt });
+  res.json({
+    ok: true,
+    isReady,
+    state: state || lastState || null,
+    authenticatedAt: lastAuthAt,
+    lastQRAt,
+    loadingScreen
+  });
 });
 
 // POST /send-message
-// Body: { numero: '5511999999999' | '5511999999999@c.us' | '1203...@g.us', message: 'texto' }
 app.post('/send-message', async (req, res) => {
   try {
     const { numero, message } = req.body || {};
@@ -137,7 +190,7 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
-// Rota de upload — middleware SOMENTE aqui
+// Upload
 app.post('/upload',
   fileUpload({ createParentPath: true, limits: { fileSize: 20 * 1024 * 1024 }, abortOnLimit: true }),
   async (req, res) => {
