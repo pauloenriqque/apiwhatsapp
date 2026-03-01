@@ -6,7 +6,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const QRCode = require('qrcode'); // para gerar SVG no endpoint /qr
+const QRCode = require('qrcode');
 
 let qrcodeTerm = null;
 try { qrcodeTerm = require('qrcode-terminal'); } catch (_) {}
@@ -17,14 +17,14 @@ const PORT = process.env.PORT || 8000;
 let isReady = false;
 let lastState = null;
 let lastAuthAt = null;
-let lastQR = null;         // QR atual (texto)
-let lastQRAt = null;       // quando recebemos o QR
-let loadingScreen = null;  // progresso do loading
+let lastQR = null;
+let lastQRAt = null;
+let loadingScreen = null;
 
-// ----------------- WhatsApp Web JS (Puppeteer) -----------------
-// Não definimos `executablePath`: o Puppeteer usa o Chrome baixado no build e salvo em ./.cache/puppeteer
+// IMPORTANTE: Não definimos executablePath (Puppeteer encontra o Chrome baixado no build)
+// Flags focadas em containers/headless (no-sandbox, shm reduzido, sem quic/zygote, etc.)
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' }),
+  authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' /*, dataPath: '/data/.wwebjs_auth'*/ }),
   puppeteer: {
     headless: 'new',
     args: [
@@ -34,14 +34,18 @@ const client = new Client({
       '--disable-gpu',
       '--no-zygote',
       '--single-process',
-      '--window-size=1280,800',
       '--disable-features=TranslateUI',
-      '--hide-scrollbars'
+      '--hide-scrollbars',
+      '--window-size=1280,800',
+      '--lang=pt-BR',
+      '--disable-quic',
+      '--ignore-certificate-errors',
+      '--ignore-certificate-errors-spki-list'
     ]
   }
 });
 
-// ====== Eventos p/ diagnóstico ======
+// ====== Eventos detalhados p/ diagnóstico ======
 client.on('loading_screen', (percent, msg) => {
   loadingScreen = { percent, msg, at: new Date() };
   console.log('[loading_screen]', percent, msg);
@@ -57,14 +61,13 @@ client.on('qr', (qr) => {
 client.on('authenticated', () => {
   lastAuthAt = new Date();
   console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
-  // limpamos o QR armazenado para evitar expor QR antigo
   lastQR = null;
   lastQRAt = null;
 });
 
 client.on('auth_failure', (m) => {
   console.error('[auth_failure]', m);
-  // se falhar auth, em geral o fluxo volta a exibir QR
+  // Dica: se houver auth_failure frequente, limpe aparelhos conectados no celular e tente novo QR
 });
 
 client.on('change_state', (state) => {
@@ -88,19 +91,17 @@ client.on('disconnected', (reason) => {
   console.warn('[disconnected]', reason);
 });
 
-// Inicia o cliente
 client.initialize();
 
 // ----------------- Express App -----------------
 const app = express();
 
-// Health-check minimalista (HEAD/GET)
+// Health-check minimalista
 app.head('/', (_req, res) => res.status(200).end());
 app.get('/healthz', (_req, res) => res.json({ ok: true, isReady, lastState, loadingScreen }));
 
-// Log simples de requests
+// Log simples de requests (evita poluir com /healthz)
 app.use((req, _res, next) => {
-  // Evita poluir muito os logs com health-checks
   if (req.path !== '/healthz') {
     console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
   }
@@ -116,14 +117,12 @@ app.get('/', (_req, res) => {
     .send(`App running on *:${PORT}\nBOT-ZDG: ${isReady ? 'ready' : 'initializing'}\n`);
 });
 
-// Novo: exibe o QR atual como SVG no navegador
+// Exibe QR atual como SVG
 app.get('/qr', async (_req, res) => {
   try {
     if (!lastQR) {
-      return res
-        .status(404)
-        .type('text/plain; charset=utf-8')
-        .send('QR ainda não disponível. Tente novamente em alguns segundos.');
+      return res.status(404).type('text/plain; charset=utf-8')
+        .send('QR ainda não disponível. Atualize em alguns segundos.');
     }
     const svg = await QRCode.toString(lastQR, { type: 'svg', errorCorrectionLevel: 'M' });
     res.type('image/svg+xml').send(svg);
@@ -132,7 +131,7 @@ app.get('/qr', async (_req, res) => {
   }
 });
 
-// Status completo
+// Status
 app.get('/status', async (_req, res) => {
   let state = null;
   try { state = await client.getState(); } catch (_) {}
@@ -146,7 +145,7 @@ app.get('/status', async (_req, res) => {
   });
 });
 
-// POST /send-message
+// Envio de mensagem
 app.post('/send-message', async (req, res) => {
   try {
     const { numero, message } = req.body || {};
@@ -172,7 +171,7 @@ app.post('/send-message', async (req, res) => {
         if (!wid || !wid._serialized) {
           return res.status(404).json({ ok: false, error: 'Número não encontrado no WhatsApp (getNumberId retornou vazio).' });
         }
-        chatId = wid._serialized; // ex.: 5511999999999@c.us
+        chatId = wid._serialized;
       }
     }
 
@@ -195,7 +194,7 @@ app.post('/upload',
   fileUpload({ createParentPath: true, limits: { fileSize: 20 * 1024 * 1024 }, abortOnLimit: true }),
   async (req, res) => {
     if (!req.files || !req.files.file) return res.status(400).send('Nenhum arquivo recebido');
-    const myFile = req.files.file; // campo "file"
+    const myFile = req.files.file;
     const saveDir = path.join(process.cwd(), 'uploads');
     fs.mkdirSync(saveDir, { recursive: true });
     const dest = path.join(saveDir, myFile.name);
@@ -212,7 +211,6 @@ app.post('/upload',
 const server = http.createServer(app);
 server.listen(PORT, () => console.log(`App running on *: ${PORT}`));
 
-// Graceful shutdown
 function shutdown(signal) {
   console.log(`\n${signal} recebido. Encerrando...`);
   server.close(() => console.log('Servidor HTTP fechado.'));
