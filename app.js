@@ -22,29 +22,36 @@ let lastState = null;
 let lastAuthAt = null;
 
 // ----------------- WhatsApp Web JS (Puppeteer) -----------------
-// IMPORTANTE: não definimos `executablePath` aqui.
-// O Puppeteer vai localizar o Chrome baixado no build (postinstall) e salvo em ./.cache/puppeteer
-// Flags recomendadas para ambientes sem sandbox/GUI (Render)
+// Não definimos `executablePath` aqui.
+// O Puppeteer encontra o Chrome baixado no build (postinstall) e salvo em ./.cache/puppeteer
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' }),
   puppeteer: {
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    // Flags recomendadas em ambientes conteinerizados/headless
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process'
+    ]
   }
 });
 
-client.once('qr', (qr) => {
+client.on('qr', (qr) => {
   console.log('QR RECEIVED');
   if (qrcode) qrcode.generate(qr, { small: true });
   else console.log(qr);
 });
 
-client.once('authenticated', () => {
+client.on('authenticated', () => {
   lastAuthAt = new Date();
   console.log('₢ BOT-ZDG Autenticado');
 });
 
-client.once('ready', async () => {
+client.on('ready', async () => {
   isReady = true;
   console.log('₢ BOT-ZDG Dispositivo pronto');
   try {
@@ -85,7 +92,6 @@ app.get('/status', async (req, res) => {
   res.json({ ok: true, isReady, state, authenticatedAt: lastAuthAt });
 });
 
-// ================== PATCH SOLICITADO ==================
 // POST /send-message
 // Body: { numero: '5511999999999' | '5511999999999@c.us' | '1203...@g.us', message: 'texto' }
 app.post('/send-message', async (req, res) => {
@@ -162,4 +168,3 @@ function shutdown(signal) {
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-``
