@@ -16,7 +16,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!MONGODB_URI) {
   console.error("[FATAL] MONGODB_URI não definida nas variáveis de ambiente.");
-  // Não encerramos o processo; deixamos o Render ver o /healthz (que vai falhar) e logs
+  // Não encerramos; o retry e os logs ajudam a diagnosticar
 }
 
 // ----------------- App/Server/Socket -----------------
@@ -28,7 +28,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(fileUpload({ debug: false }));
 
-// Servir estáticos (se quiser colocar CSS/JS/ícones em /public)
+// Servir estáticos opcionais (CSS/JS/ícones) em /public
 app.use("/public", express.static(path.join(__dirname, "public")));
 
 // Página inicial (cliente renderiza o QR no navegador)
@@ -36,15 +36,15 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-// Health check estável (configure o Render para apontar para este path)
+// Health check estável (configure o Render para este path)
 app.get("/healthz", (req, res) => res.status(200).send("OK"));
 
-// Rota de status útil para diagnóstico rápido
+// Rota de status para diagnóstico
+// readyState do Mongoose: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
 let isReady = false;
 app.get("/status", (req, res) => {
   let mongo = "desconhecido";
   try { mongo = mongoose.connection.readyState; } catch (_) {}
-  // readyState: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
   res.json({ ok: true, ready: isReady, mongoReadyState: mongo });
 });
 
@@ -52,6 +52,7 @@ app.get("/status", (req, res) => {
 let client;       // whatsapp client
 let store;        // wwebjs-mongo store
 let restarting = false;
+let lastQR = null; // cache do último QR para o cliente que entrou depois
 
 async function bootstrap() {
   // 1) Conecta no Mongoose (uma única vez)
@@ -64,9 +65,9 @@ async function bootstrap() {
     throw new Error("MONGODB_URI ausente");
   }
 
-  // 2) Cria o MongoStore com a instância do Mongoose (exigência do wwebjs-mongo)
+  // 2) Cria o MongoStore com a instância do Mongoose (obrigatório p/ wwebjs-mongo)
   if (!store) {
-    store = new MongoStore({ mongoose }); // <- obrigatório ser o mongoose (não MongoClient)
+    store = new MongoStore({ mongoose });
   }
 
   // 3) Cria client com RemoteAuth usando o store
@@ -91,8 +92,8 @@ async function bootstrap() {
 
   // === Eventos do WhatsApp ===
   client.on("qr", (qr) => {
-    // Envia somente o TEXTO do QR para o cliente renderizar com qrcode.min.js
-    io.emit("qr", { qr });
+    lastQR = qr; // guarda o último QR
+    io.emit("qr", { qr }); // envia para quem já está conectado
     io.emit("message", "₢ BOT-ZDG QRCode recebido — abra a câmera do seu celular.");
     console.log("[QR] emitido para clientes via Socket.IO");
   });
@@ -144,8 +145,17 @@ async function bootstrap() {
 // ----------------- Socket.IO (lado do cliente) -----------------
 io.on("connection", (socket) => {
   socket.emit("message", "₢ BOT-ZDG - Iniciado");
+
+  // Cliente pede status atual
   socket.on("get-status", () => {
     socket.emit("status", { ready: isReady });
+  });
+
+  // Cliente recém-conectado pode pedir o último QR (se ainda não autenticou)
+  socket.on("get-latest-qr", () => {
+    if (lastQR && !isReady) {
+      socket.emit("qr", { qr: lastQR });
+    }
   });
 });
 
@@ -183,6 +193,25 @@ app.post("/send-message", async (req, res) => {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
+
+// ----------------- Upload opcional -----------------
+app.post(
+  "/upload",
+  fileUpload({ createParentPath: true, limits: { fileSize: 20 * 1024 * 1024 }, abortOnLimit: true }),
+  async (req, res) => {
+    try {
+      if (!req.files || !req.files.file) return res.status(400).send("Nenhum arquivo recebido");
+      const myFile = req.files.file; // campo "file"
+      const saveDir = path.join(process.cwd(), "uploads");
+      require("fs").mkdirSync(saveDir, { recursive: true });
+      const dest = path.join(saveDir, myFile.name);
+      await myFile.mv(dest);
+      res.json({ ok: true, saved: dest });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  }
+);
 
 // ----------------- Start + Retry com backoff -----------------
 async function startWhatsAppWithRetry(retry = 0) {
