@@ -1,4 +1,4 @@
-// app.js (RemoteAuth + Mongo — PERSISTE a sessão)
+// app.js — whatsapp-web.js + RemoteAuth (Mongo) + QR + Express + Socket.IO
 const { Client, RemoteAuth, MessageMedia, List, Location } = require('whatsapp-web.js');
 const express = require('express');
 const { body, validationResult } = require('express-validator');
@@ -9,42 +9,51 @@ const fileUpload = require('express-fileupload');
 const { MongoClient } = require('mongodb');
 const { MongoStore } = require('wwebjs-mongo');
 
+// Porta do Render vem em process.env.PORT
 const PORT = process.env.PORT || 8000;
-const MONGODB_URI = process.env.MONGODB_URI; // defina no Render
+const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!MONGODB_URI) {
-  console.error('Falta a env MONGODB_URI');
+  console.error('Faltando variável de ambiente MONGODB_URI');
   process.exit(1);
 }
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIO(server, { cors: { origin: '*' } });
+// Socket.IO 2.x
+const io = socketIO(server);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(fileUpload({ debug: false }));
 app.use('/', express.static(__dirname + '/'));
 
+// Página inicial (para exibir QR via Socket.IO)
 app.get('/', (req, res) => {
   res.sendFile('index.html', { root: __dirname });
 });
+
+// Health check rápido e estável (configure no Render)
 app.get('/healthz', (req, res) => res.status(200).send('OK'));
 
+let client;       // whatsapp client
+let mongoClient;  // conexão Mongo
+let store;        // store do wwebjs-mongo
 let restarting = false;
-let client; // whatsapp client
-let mongoClient;
-let store;
 
 async function bootstrap() {
-  mongoClient = new MongoClient(MONGODB_URI, { family: 4 });
-  await mongoClient.connect();
-  store = new MongoStore({ client: mongoClient, dbName: 'whatsapp' });
+  if (!mongoClient) {
+    mongoClient = new MongoClient(MONGODB_URI, { family: 4 });
+    await mongoClient.connect();
+  }
+  if (!store) {
+    store = new MongoStore({ client: mongoClient, dbName: 'whatsapp' });
+  }
 
   client = new Client({
     authStrategy: new RemoteAuth({
       store,
-      backupSyncIntervalMs: 60_000, // salva credenciais periodicamente
+      backupSyncIntervalMs: 60_000, // salva periodicamente no Mongo
     }),
     puppeteer: {
       headless: true,
@@ -56,16 +65,21 @@ async function bootstrap() {
         '--no-first-run',
         '--no-zygote',
         '--disable-gpu'
-      ]
-    }
+        // Evite '--single-process' em Linux moderno: pode causar instabilidade
+      ],
+    },
   });
 
+  // === Eventos do WhatsApp ===
   client.on('qr', async (qr) => {
-    console.log('QR RECEIVED');
-    // Com RemoteAuth o QR aparece apenas na primeira vez (ou se a sessão expirar)
-    const dataUrl = await qrcode.toDataURL(qr);
-    io.emit('qr', dataUrl);
-    io.emit('message', '₢ BOT-ZDG QRCode recebido, aponte a câmera do seu celular!');
+    console.log('[QR] recebido');
+    try {
+      const dataUrl = await qrcode.toDataURL(qr);
+      io.emit('qr', dataUrl);
+      io.emit('message', '₢ BOT-ZDG QRCode recebido, aponte a câmera do seu celular!');
+    } catch (e) {
+      console.error('Falha ao gerar QR:', e);
+    }
   });
 
   client.on('ready', () => {
@@ -81,26 +95,32 @@ async function bootstrap() {
     console.log('₢ BOT-ZDG Autenticado');
   });
 
-  client.on('auth_failure', () => {
+  client.on('auth_failure', (m) => {
     io.emit('message', '₢ BOT-ZDG falha na autenticação, reiniciando...');
-    console.error('₢ BOT-ZDG falha na autenticação');
+    console.error('₢ BOT-ZDG falha na autenticação', m);
   });
 
   client.on('change_state', (state) => {
-    console.log('₢ BOT-ZDG Status de conexão: ', state);
+    console.log('₢ BOT-ZDG Status de conexão:', state);
   });
 
-  client.on('disconnected', (reason) => {
+  client.on('disconnected', async (reason) => {
     io.emit('message', '₢ BOT-ZDG Cliente desconectado!');
-    console.log('₢ BOT-ZDG Cliente desconectado', reason);
+    console.log('₢ BOT-ZDG Cliente desconectado:', reason);
+    // Reinicializa com cuidado para evitar múltiplas instâncias
     if (!restarting) {
       restarting = true;
+      try {
+        await client.destroy();
+      } catch {}
       setTimeout(async () => {
         try {
-          await client.destroy();
-        } catch {}
-        await bootstrap(); // reinicia com as mesmas credenciais do Mongo
-        restarting = false;
+          await bootstrap(); // reinicia reaproveitando a sessão do Mongo
+        } catch (e) {
+          console.error('Falha ao reinicializar:', e);
+        } finally {
+          restarting = false;
+        }
       }, 2000);
     }
   });
@@ -108,12 +128,13 @@ async function bootstrap() {
   await client.initialize();
 }
 
+// === Socket.IO conexão (lado do browser) ===
 io.on('connection', (socket) => {
   socket.emit('message', '₢ BOT-ZDG - Iniciado');
   socket.emit('qr', './icon.svg');
 });
 
-// POST /send-message
+// === API: enviar mensagem ===
 app.post('/send-message', [
   body('number').notEmpty(),
   body('message').notEmpty(),
@@ -129,11 +150,10 @@ app.post('/send-message', [
   const numberDDD = number.substr(2, 2);
   const numberUser = number.substr(-8, 8);
 
-  function send(to) {
-    return client.sendMessage(to, message)
-      .then(response => res.status(200).json({ status: true, message: 'BOT-ZDG Mensagem enviada', response }))
-      .catch(err => res.status(500).json({ status: false, message: 'BOT-ZDG Mensagem não enviada', response: err?.message || err }));
-  }
+  const send = (to) =>
+    client.sendMessage(to, message)
+      .then((response) => res.status(200).json({ status: true, message: 'BOT-ZDG Mensagem enviada', response }))
+      .catch((err) => res.status(500).json({ status: false, message: 'BOT-ZDG Mensagem não enviada', response: err?.message || err }));
 
   if (numberDDI !== '55') {
     return send(number + '@c.us');
@@ -144,6 +164,7 @@ app.post('/send-message', [
   }
 });
 
+// === Start HTTP e bot ===
 server.listen(PORT, async () => {
   console.log('App running on *: ' + PORT);
   try {
@@ -154,7 +175,7 @@ server.listen(PORT, async () => {
   }
 });
 
-// Encerramento gracioso
+// Encerramento gracioso (Render envia SIGTERM ao redeploy)
 process.on('SIGTERM', async () => {
   console.log('SIGTERM recebido. Encerrando...');
   try { await client?.destroy(); } catch {}
