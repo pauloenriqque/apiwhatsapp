@@ -1,5 +1,16 @@
 "use strict";
 
+/**
+ * app.js — BOT-ZDG (WhatsApp Web JS + RemoteAuth + MongoStore)
+ *
+ * Requisitos de ambiente:
+ *  - MONGODB_URI: string SRV do MongoDB Atlas (ex.: mongodb+srv://user:pass@cluster/db?opts)
+ *
+ * Notas importantes:
+ *  - RemoteAuth salva/restaura a sessão no Mongo (ideal para hosts com FS efêmero como Render Free).
+ *  - Aguarde o evento [remote_session_saved] após autenticar antes de reiniciar/deployar.
+ */
+
 const express = require('express');
 const fileUpload = require('express-fileupload');
 const http = require('http');
@@ -35,16 +46,16 @@ const USER_AGENT =
 let client = null;
 let store = null;
 
-// --------- Função que cria o Client (usada também pelo /reset) ---------
+/** Cria/retorna uma nova instância do Client com RemoteAuth + MongoStore */
 function createClient() {
   client = new Client({
     // >>> PERSISTÊNCIA DE SESSÃO VIA REMOTEAUTH (MongoStore) <<<
     authStrategy: new RemoteAuth({
       clientId: 'BOT-ZDG',
       store,
-      // faz backup periódico da sessão para o store remoto
-      backupSyncIntervalMs: 5 * 60 * 1000 // 5 min
-      // dataPath (local temporário) pode ficar default; no restart a sessão volta do Mongo
+      // Faz backup periódico da sessão para o store remoto (mínimo aceito: 60.000 ms).
+      backupSyncIntervalMs: 60_000
+      // dataPath local temporário fica default; no restart, a sessão volta do Mongo
     }),
 
     takeoverOnConflict: true,
@@ -69,7 +80,7 @@ function createClient() {
         '--ignore-certificate-errors-spki-list',
         `--user-agent=${USER_AGENT}`
       ]
-      // Não definimos executablePath: o Puppeteer usa o Chrome baixado no build (postinstall)
+      // Não defina executablePath: o Chrome já é baixado no build (postinstall) e será encontrado.
     }
   });
 
@@ -82,7 +93,7 @@ function createClient() {
   loadingScreen = null;
   initializingAt = new Date();
 
-  // ====== Eventos ======
+  // ====== Eventos (diagnóstico) ======
   client.on('loading_screen', (percent, msg) => {
     loadingScreen = { percent, msg, at: new Date() };
     console.log('[loading_screen]', percent, msg);
@@ -124,6 +135,11 @@ function createClient() {
     } catch (e) {
       console.warn('getState() falhou após ready:', e?.message || String(e));
     }
+  });
+
+  // >>> Evento de confirmação de sessão salva no store remoto <<<
+  client.on('remote_session_saved', (id) => {
+    console.log('[remote_session_saved]', id || 'BOT-ZDG');
   });
 
   client.on('disconnected', (reason) => {
@@ -298,11 +314,13 @@ app.post('/upload',
 const server = http.createServer(app);
 server.listen(PORT, () => console.log(`App running on *: ${PORT}`));
 
+/** Graceful shutdown: dá tempo ao RemoteAuth para flush do backup antes de sair */
 function shutdown(signal) {
   console.log(`\n${signal} recebido. Encerrando...`);
   server.close(() => console.log('Servidor HTTP fechado.'));
   try { client?.destroy?.(); } catch (_) {}
-  setTimeout(() => process.exit(0), 500);
+  // Aumente o tempo de espera para permitir o snapshot no store remoto
+  setTimeout(() => process.exit(0), 8000);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
