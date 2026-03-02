@@ -22,11 +22,26 @@ let lastQRAt = null;
 let loadingScreen = null;
 let initializingAt = new Date();
 
-// Cria/retorna uma instância nova do cliente (para suportar /reset)
+// Escolha um UA comum de Chrome estável em Linux.
+// (O Puppeteer já usa um UA válido, mas setar explicitamente ajuda a evitar renovações constantes de QR em alguns ambientes.)
+const USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36';
+
+// Cria/retorna uma instância nova do cliente (suporta /reset)
 let client = null;
 function createClient() {
   client = new Client({
-    authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' /*, dataPath: '/data/.wwebjs_auth'*/ }),
+    // IMPORTANTE: se você anexar um Disk no Render, troque para:
+    // authStrategy: new LocalAuth({ clientId: 'BOT-ZDG', dataPath: '/data/.wwebjs_auth' }),
+    authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' }),
+
+    // Assume a sessão em caso de conflito e reinicia se falhar autenticação
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 15_000,
+    restartOnAuthFail: true,
+
+    // Puppeteer/headless em container
     puppeteer: {
       headless: 'new',
       args: [
@@ -42,8 +57,12 @@ function createClient() {
         '--lang=pt-BR',
         '--disable-quic',
         '--ignore-certificate-errors',
-        '--ignore-certificate-errors-spki-list'
+        '--ignore-certificate-errors-spki-list',
+        `--user-agent=${USER_AGENT}`,
+        // (opcional) se sua rede exigir proxy, você pode setar aqui:
+        // `--proxy-server=${process.env.HTTP_PROXY}`
       ]
+      // Não definimos executablePath: o Puppeteer usa o Chrome baixado no build (postinstall)
     }
   });
 
@@ -72,7 +91,7 @@ function createClient() {
   client.on('authenticated', () => {
     lastAuthAt = new Date();
     console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
-    // limpamos o QR armazenado para evitar expor QR antigo
+    // Limpa QR armazenado
     lastQR = null;
     lastQRAt = null;
   });
