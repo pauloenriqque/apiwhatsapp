@@ -198,7 +198,8 @@ server.listen(PORT, async () => {
 
 // ----------------- Graceful shutdown -----------------
 function shutdown(signal) {
-  console.log(`\n${signal} recebido. Encerrando...`);
+  console.log(`
+${signal} recebido. Encerrando...`);
   server.close(() => console.log('Servidor HTTP fechado.'));
   (async () => {
     try { await client?.destroy(); } catch (_) {}
