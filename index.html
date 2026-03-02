@@ -1,36 +1,83 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="pt-BR">
 <head>
-<title>whatsapp API </title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BOT-ZDG · Pareamento</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background: #0b132b; color: #eee; }
+    .card { max-width: 520px; margin: 0 auto; background: #1c2541; border-radius: 12px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    h1 { margin-top: 0; font-weight: 700; font-size: 20px; color: #fff; }
+    #status { font-size: 14px; color: #cbd5e1; margin-bottom: 16px; white-space: pre-line; }
+    #qr { display: grid; place-items: center; width: 100%; min-height: 280px; background: #0b132b; border-radius: 8px; border: 1px dashed #334155; }
+    canvas { background: #fff; padding: 8px; border-radius: 4px; }
+    .ok { color: #22c55e; }
+    .msg { margin: 8px 0; font-size: 14px; }
+    .small { font-size: 12px; color: #94a3b8; }
+  </style>
 </head>
 <body>
-<div id="app">
-	<h1> Whatsapp API</h1>
-	<img src="" alt="QR Code" id="qrcode">
-	<h3> logs:</h3>
-	<ul class="logs"></ul>
-	</div>
-	<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.5.1/jquery.min.js" crossorigin="anonymous"></script>
-		<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.3.0/socket.io.js" crossorigin="anonymous"></script>
-		
-		<script>
-		$(document).ready(function(){
-		var socket = io();
-		socket.on('message', function(msg){
-		$('.logs').append($('<li>').text(msg));
-		});
-		socket.on('qr', function(src){
-		$('#qrcode').attr('src',src);
-		$('#qrcode').show();
-		});
-		socket.on('ready',function(data){
-		$('#qrcode').hide();
-		});
-		socket.on('authenticated', function(data){
-		$('#qrcode').hide();
-		});
-		});
-		</script>
-		</body>
-		</html>
-		
+  <div class="card">
+    <h1>BOT-ZDG · Pareamento via QR</h1>
+    <div id="status">Aguardando QR Code...</div>
+    <div id="qr"><div class="small">O QR aparecerá aqui quando disponível.</div></div>
+    <div class="msg small">Mantenha esta página aberta e aponte a câmera do WhatsApp do celular para o QR.</div>
+  </div>
+
+  <!-- Socket.IO client (servido pelo próprio servidor) -->
+  <script src="/socket.io/socket.io.js"></script>
+  <!-- Biblioteca de QR no navegador -->
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+  <script>
+    const elStatus = document.getElementById('status');
+    const elQR = document.getElementById('qr');
+
+    function setStatus(text, ok=false) {
+      elStatus.innerHTML = ok ? `<span class="ok">${text}</span>` : text;
+    }
+
+    function renderQR(qrText) {
+      elQR.innerHTML = '';
+      const canvas = document.createElement('canvas');
+      elQR.appendChild(canvas);
+      // Gera o QR no CLIENTE usando a lib qrcode
+      QRCode.toCanvas(canvas, qrText, { width: 280, margin: 2, errorCorrectionLevel: 'M'f (err) {
+          elQR.innerHTML = '<div class="small">Falha ao renderizar QR no navegador.</div>';
+          console.error(err);
+        }
+      });
+    }
+
+    const socket = io();
+    socket.on('connect', () => {
+      setStatus('Conectado ao servidor. Aguardando QR...');
+      socket.emit('get-status');
+    });
+
+    socket.on('status', (data) => {
+      if (data?.ready) {
+        setStatus('Dispositivo pronto. Você já pode fechar esta página.', true);
+        elQR.innerHTML = '<div class="small">Sessão ativa ✅</div>';
+      }
+    });
+
+    socket.on('message', (m) => {
+      setStatus(m);
+    });
+
+    socket.on('qr', ({ qr }) => {
+      setStatus('QR Code recebido. Abra o WhatsApp no celular \u2192 Dispositivos conectados \u2192 Conectar um dispositivo');
+      renderQR(qr);
+    });
+
+    socket.on('ready', (m) => {
+      setStatus(m, true);
+      elQR.innerHTML = '<div class="small">Sessão ativa ✅</div>';
+    });
+
+    socket.on('authenticated', (m) => {
+      setStatus(m, true);
+    });
+  </script>
+</body>
+</html>
