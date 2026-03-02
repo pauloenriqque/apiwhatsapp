@@ -24,31 +24,35 @@
     <div class="msg small">Mantenha esta página aberta e aponte a câmera do WhatsApp do celular para o QR.</div>
   </div>
 
-  <!-- Socket.IO client (servido pelo próprio servidor) -->
+  <!-- Socket.IO client (servido pelo próprio servidor Node) -->
   <script src="/socket.io/socket.io.js"></script>
   <!-- Biblioteca de QR no navegador -->
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+
   <script>
     const elStatus = document.getElementById('status');
     const elQR = document.getElementById('qr');
 
     function setStatus(text, ok=false) {
       elStatus.innerHTML = ok ? `<span class="ok">${text}</span>` : text;
+      console.log('[status]', text);
     }
 
     function renderQR(qrText) {
       elQR.innerHTML = '';
       const canvas = document.createElement('canvas');
       elQR.appendChild(canvas);
-      // Gera o QR no CLIENTE usando a lib qrcode
-      QRCode.toCanvas(canvas, qrText, { width: 280, margin: 2, errorCorrectionLevel: 'M'f (err) {
+      QRCode.toCanvas(canvas, qrText, { width: 280, margin: 2, errorCorrectionLevel: 'M' }, function (err) {
+        if (err) {
           elQR.innerHTML = '<div class="small">Falha ao renderizar QR no navegador.</div>';
-          console.error(err);
+          console.error('[qr error]', err);
         }
       });
     }
 
+    // Conecta ao Socket.IO
     const socket = io();
+
     socket.on('connect', () => {
       setStatus('Conectado ao servidor. Aguardando QR...');
       socket.emit('get-status');
@@ -61,12 +65,11 @@
       }
     });
 
-    socket.on('message', (m) => {
-      setStatus(m);
-    });
+    socket.on('message', (m) => setStatus(m));
 
+    // Recebe a string do QR e renderiza no canvas
     socket.on('qr', ({ qr }) => {
-      setStatus('QR Code recebido. Abra o WhatsApp no celular \u2192 Dispositivos conectados \u2192 Conectar um dispositivo');
+      setStatus('QR Code recebido. Abra o WhatsApp no celular → Dispositivos conectados → Conectar um dispositivo');
       renderQR(qr);
     });
 
@@ -75,9 +78,7 @@
       elQR.innerHTML = '<div class="small">Sessão ativa ✅</div>';
     });
 
-    socket.on('authenticated', (m) => {
-      setStatus(m, true);
-    });
+    socket.on('authenticated', (m) => setStatus(m, true));
   </script>
 </body>
 </html>
