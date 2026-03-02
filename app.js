@@ -1,11 +1,11 @@
-// app.js — whatsapp-web.js + RemoteAuth (Mongo) + QR no cliente + Express + Socket.IO
+// app.js — whatsapp-web.js + RemoteAuth (Mongo) + QR no cliente + Express + Socket.IO (usando Mongoose)
 "use strict";
 const express = require('express');
 const fileUpload = require('express-fileupload');
 const http = require('http');
 const path = require('path');
 const { Client, RemoteAuth, MessageMedia, List, Location } = require('whatsapp-web.js');
-const { MongoClient } = require('mongodb');
+const mongoose = require('mongoose');
 const { MongoStore } = require('wwebjs-mongo');
 const socketIO = require('socket.io');
 
@@ -37,21 +37,21 @@ app.get('/', (req, res) => {
 // Health check estável (configure o Render para usar esta rota)
 app.get('/healthz', (req, res) => res.status(200).send('OK'));
 
-// ----------------- WhatsApp Client (RemoteAuth + Mongo) -----------------
+// ----------------- WhatsApp Client (RemoteAuth + Mongo via Mongoose) -----------------
 let client;       // whatsapp client
-let mongoClient;  // conexão Mongo
 let store;        // store do wwebjs-mongo
 let restarting = false;
 let isReady = false;
 
 async function bootstrap() {
-  // Conecta no Mongo uma única vez
-  if (!mongoClient) {
-    mongoClient = new MongoClient(MONGODB_URI, { family: 4 });
-    await mongoClient.connect();
+  // Conecta no Mongoose uma vez (reutiliza conexão interna)
+  if (mongoose.connection.readyState === 0) {
+    await mongoose.connect(MONGODB_URI, { family: 4 });
   }
+
   if (!store) {
-    store = new MongoStore({ client: mongoClient, dbName: 'whatsapp' });
+    // wwebjs-mongo 1.1.0 requer instância do Mongoose
+    store = new MongoStore({ mongoose });
   }
 
   client = new Client({
@@ -75,9 +75,7 @@ async function bootstrap() {
 
   // Eventos do WhatsApp
   client.on('qr', (qr) => {
-    // IMPORTANTE: enviamos o *texto* do QR para o cliente renderizar.
-    // Assim, o QR é gerado no navegador, não no backend.
-    io.emit('qr', { qr });
+    io.emit('qr', { qr }); // Envia apenas o texto do QR para o cliente renderizar
     io.emit('message', '₢ BOT-ZDG QRCode recebido — abra a câmera do seu celular.');
     console.log('[QR] emitido para clientes via Socket.IO');
   });
@@ -129,7 +127,6 @@ async function bootstrap() {
 // ----------------- Socket.IO (lado do cliente) -----------------
 io.on('connection', (socket) => {
   socket.emit('message', '₢ BOT-ZDG - Iniciado');
-  // Cliente pode requisitar o status atual
   socket.on('get-status', () => {
     socket.emit('status', { ready: isReady });
   });
@@ -198,12 +195,11 @@ server.listen(PORT, async () => {
 
 // ----------------- Graceful shutdown -----------------
 function shutdown(signal) {
-  console.log(`
-${signal} recebido. Encerrando...`);
+  console.log(`\n${signal} recebido. Encerrando...`);
   server.close(() => console.log('Servidor HTTP fechado.'));
   (async () => {
     try { await client?.destroy(); } catch (_) {}
-    try { await mongoClient?.close(); } catch (_) {}
+    try { await mongoose.connection.close(false); } catch (_) {}
     setTimeout(() => process.exit(0), 800);
   })();
 }
