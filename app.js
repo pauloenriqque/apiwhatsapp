@@ -1,399 +1,163 @@
-"use strict";
-
-/**
- * app.js — BOT-ZDG (WhatsApp Web JS + RemoteAuth + MongoStore + Pairing Code)
- *
- * VARIÁVEIS DE AMBIENTE:
- *  - MONGODB_URI: string SRV do MongoDB Atlas (ex.: mongodb+srv://user:pass@cluster/db?opts)
- *  - (opcional) PAIRING_PHONE: número para pareamento por CÓDIGO, em E.164 SEM '+', ex.: 5511999999999
- *
- * Rotas:
- *  - GET  /qr                → QR atual (SVG) quando o cliente estiver pedindo QR
- *  - GET  /status            → estado do cliente (isReady, state, timestamps)
- *  - POST /reset             → reinicializa o cliente (gera novo QR/código)
- *  - POST /pairing-code      → { "phone": "5511999999999" } → recria o cliente pedindo CÓDIGO; responde com o código
- *  - POST /send-message      → { "numero": "55DDDNÚMERO", "message": "texto" }
- */
-
+// app.js (RemoteAuth + Mongo — PERSISTE a sessão)
+const { Client, RemoteAuth, MessageMedia, List, Location } = require('whatsapp-web.js');
 const express = require('express');
-const fileUpload = require('express-fileupload');
+const { body, validationResult } = require('express-validator');
+const socketIO = require('socket.io');
+const qrcode = require('qrcode');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
-
-const { Client, RemoteAuth } = require('whatsapp-web.js');
+const fileUpload = require('express-fileupload');
+const { MongoClient } = require('mongodb');
 const { MongoStore } = require('wwebjs-mongo');
-const mongoose = require('mongoose');
-
-const QRCode = require('qrcode');
-
-let qrcodeTerm = null;
-try { qrcodeTerm = require('qrcode-terminal'); } catch (_) {}
 
 const PORT = process.env.PORT || 8000;
+const MONGODB_URI = process.env.MONGODB_URI; // defina no Render
 
-// ----------------- Estado -----------------
-let isReady = false;
-let lastState = null;
-let lastAuthAt = null;
-let lastQR = null;
-let lastQRAt = null;
-let lastPairingCode = null;
-let lastPairingAt = null;
-let loadingScreen = null;
-let initializingAt = new Date();
+if (!MONGODB_URI) {
+  console.error('Falta a env MONGODB_URI');
+  process.exit(1);
+}
 
-// User-Agent estável (ajuda em headless)
-const USER_AGENT =
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36';
+const app = express();
+const server = http.createServer(app);
+const io = socketIO(server, { cors: { origin: '*' } });
 
-// Instâncias globais
-let client = null;
-let store = null;
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(fileUpload({ debug: false }));
+app.use('/', express.static(__dirname + '/'));
 
-/** Cria o Client; se 'phoneForPairing' for informado (E.164 sem '+'), usa pareamento por CÓDIGO */
-function createClient(phoneForPairing = null) {
+app.get('/', (req, res) => {
+  res.sendFile('index.html', { root: __dirname });
+});
+app.get('/healthz', (req, res) => res.status(200).send('OK'));
+
+let restarting = false;
+let client; // whatsapp client
+let mongoClient;
+let store;
+
+async function bootstrap() {
+  mongoClient = new MongoClient(MONGODB_URI, { family: 4 });
+  await mongoClient.connect();
+  store = new MongoStore({ client: mongoClient, dbName: 'whatsapp' });
+
   client = new Client({
-    // Persistência remota da sessão (Mongo)
     authStrategy: new RemoteAuth({
-      clientId: 'BOT-ZDG',
       store,
-      // mínimo aceito pela estratégia
-      backupSyncIntervalMs: 60_000
+      backupSyncIntervalMs: 60_000, // salva credenciais periodicamente
     }),
-
-    // Janela maior para autenticação (evita timeouts prematuros)
-    authTimeoutMs: 120_000,
-
-    // Pareamento por CÓDIGO (sem QR) — opcional
-    ...(phoneForPairing
-      ? {
-          pairWithPhoneNumber: {
-            // E.164 sem '+'
-            phoneNumber: phoneForPairing.replace(/\D/g, ''),
-            showNotification: true,
-            intervalMs: 180_000 // renova a cada 3 min
-          }
-        }
-      : {}),
-
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 15_000,
-    restartOnAuthFail: true,
-
     puppeteer: {
-      headless: 'new',
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
         '--no-zygote',
-        '--single-process',
-        '--disable-features=TranslateUI',
-        '--hide-scrollbars',
-        '--window-size=1280,800',
-        '--lang=pt-BR',
-        '--disable-quic',
-        '--ignore-certificate-errors',
-        '--ignore-certificate-errors-spki-list',
-        `--user-agent=${USER_AGENT}`
+        '--disable-gpu'
       ]
     }
   });
 
-  // Reset de estado
-  isReady = false;
-  lastState = null;
-  lastAuthAt = null;
-  lastQR = null;
-  lastQRAt = null;
-  lastPairingCode = null;
-  lastPairingAt = null;
-  loadingScreen = null;
-  initializingAt = new Date();
-
-  // ====== Eventos ======
-  client.on('loading_screen', (percent, msg) => {
-    loadingScreen = { percent, msg, at: new Date() };
-    console.log('[loading_screen]', percent, msg);
+  client.on('qr', async (qr) => {
+    console.log('QR RECEIVED');
+    // Com RemoteAuth o QR aparece apenas na primeira vez (ou se a sessão expirar)
+    const dataUrl = await qrcode.toDataURL(qr);
+    io.emit('qr', dataUrl);
+    io.emit('message', '₢ BOT-ZDG QRCode recebido, aponte a câmera do seu celular!');
   });
 
-  client.on('qr', (qr) => {
-    lastQR = qr;
-    lastQRAt = new Date();
-    console.log('QR RECEIVED', `(at ${lastQRAt.toISOString()})`);
-    if (qrcodeTerm) qrcodeTerm.generate(qr, { small: true });
+  client.on('ready', () => {
+    io.emit('ready', '₢ BOT-ZDG Dispositivo pronto!');
+    io.emit('message', '₢ BOT-ZDG Dispositivo pronto!');
+    io.emit('qr', './check.svg');
+    console.log('₢ BOT-ZDG Dispositivo pronto');
   });
 
-  // CÓDIGO DE PAREAMENTO (sem QR)
-  client.on('code', (code) => {
-    lastPairingCode = code;
-    lastPairingAt = new Date();
-    console.log('[pairing_code]', code);
+  client.on('authenticated', () => {
+    io.emit('authenticated', '₢ BOT-ZDG Autenticado!');
+    io.emit('message', '₢ BOT-ZDG Autenticado!');
+    console.log('₢ BOT-ZDG Autenticado');
   });
 
-  client.once('authenticated', () => {
-    lastAuthAt = new Date();
-    console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
-    // Limpa QR assim que autenticar
-    lastQR = null;
-    lastQRAt = null;
-  });
-
-  client.on('auth_failure', (m) => {
-    console.error('[auth_failure]', m);
+  client.on('auth_failure', () => {
+    io.emit('message', '₢ BOT-ZDG falha na autenticação, reiniciando...');
+    console.error('₢ BOT-ZDG falha na autenticação');
   });
 
   client.on('change_state', (state) => {
-    lastState = state;
-    console.log('[change_state]', state);
-    if (state === 'CONNECTED' && !isReady) {
-      isReady = true;
-      console.log('[state->CONNECTED] isReady=true');
-    }
-  });
-
-  client.once('ready', async () => {
-    isReady = true;
-    console.log('₢ BOT-ZDG Dispositivo pronto');
-    try {
-      lastState = await client.getState();
-      console.log('getState() após ready:', lastState);
-    } catch (e) {
-      console.warn('getState() falhou após ready:', e?.message || String(e));
-    }
-  });
-
-  // Confirmação de que a sessão foi salva no store remoto (Mongo)
-  client.on('remote_session_saved', (id) => {
-    console.log('[remote_session_saved]', id || 'BOT-ZDG');
+    console.log('₢ BOT-ZDG Status de conexão: ', state);
   });
 
   client.on('disconnected', (reason) => {
-    isReady = false;
-    console.warn('[disconnected]', reason);
+    io.emit('message', '₢ BOT-ZDG Cliente desconectado!');
+    console.log('₢ BOT-ZDG Cliente desconectado', reason);
+    if (!restarting) {
+      restarting = true;
+      setTimeout(async () => {
+        try {
+          await client.destroy();
+        } catch {}
+        await bootstrap(); // reinicia com as mesmas credenciais do Mongo
+        restarting = false;
+      }, 2000);
+    }
   });
 
-  client.initialize();
+  await client.initialize();
 }
 
-// ====== Conexão ao Mongo e bootstrap ======
-(async () => {
-  if (!process.env.MONGODB_URI) {
-    console.error('[FALTA MONGODB_URI] Configure a env MONGODB_URI no Render.');
+io.on('connection', (socket) => {
+  socket.emit('message', '₢ BOT-ZDG - Iniciado');
+  socket.emit('qr', './icon.svg');
+});
+
+// POST /send-message
+app.post('/send-message', [
+  body('number').notEmpty(),
+  body('message').notEmpty(),
+], async (req, res) => {
+  const errors = validationResult(req).formatWith(({ msg }) => msg);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({ status: false, message: errors.mapped() });
+  }
+
+  const number = req.body.number;
+  const message = req.body.message;
+  const numberDDI = number.substr(0, 2);
+  const numberDDD = number.substr(2, 2);
+  const numberUser = number.substr(-8, 8);
+
+  function send(to) {
+    return client.sendMessage(to, message)
+      .then(response => res.status(200).json({ status: true, message: 'BOT-ZDG Mensagem enviada', response }))
+      .catch(err => res.status(500).json({ status: false, message: 'BOT-ZDG Mensagem não enviada', response: err?.message || err }));
+  }
+
+  if (numberDDI !== '55') {
+    return send(number + '@c.us');
+  } else if (parseInt(numberDDD) <= 30) {
+    return send('55' + numberDDD + '9' + numberUser + '@c.us');
   } else {
-    try {
-      await mongoose.connect(process.env.MONGODB_URI);
-      console.log('[MongoDB] conectado');
-
-      store = new MongoStore({ mongoose });
-
-      // Se quiser pedir CÓDIGO automaticamente na inicialização:
-      const autoPhone = (process.env.PAIRING_PHONE || '').replace(/\D/g, '') || null;
-      createClient(autoPhone || null);
-    } catch (e) {
-      console.error('[MongoDB] erro ao conectar:', e?.message || String(e));
-    }
+    return send('55' + numberDDD + numberUser + '@c.us');
   }
-})();
-
-// ====== Polling leve (3s) ======
-setInterval(async () => {
-  try {
-    const s = await client?.getState?.();
-    if (s && s !== lastState) {
-      console.log('[poll:getState] mudou:', lastState, '->', s);
-      lastState = s;
-    }
-    if (s === 'CONNECTED' && !isReady) {
-      isReady = true;
-      console.log('[poll:getState] CONNECTED; isReady=true');
-    }
-  } catch (_) {}
-}, 3000);
-
-// ----------------- Express App -----------------
-const app = express();
-
-app.head('/', (_req, res) => res.status(200).end());
-app.get('/healthz', (_req, res) => res.json({ ok: true, isReady, lastState, loadingScreen }));
-
-app.use((req, _res, next) => {
-  if (req.path !== '/healthz') {
-    console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
-  }
-  next();
 });
 
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// Home
-app.get('/', async (_req, res) => {
-  let currentState = lastState;
-  try { currentState = await client?.getState?.(); } catch (_) {}
-  const readyNow = isReady || currentState === 'CONNECTED';
-  res
-    .type('text/plain; charset=utf-8')
-    .send(`App running on *:${PORT}\nBOT-ZDG: ${readyNow ? 'ready' : 'initializing'}\n`);
-});
-
-// QR atual (SVG)
-app.get('/qr', async (_req, res) => {
+server.listen(PORT, async () => {
+  console.log('App running on *: ' + PORT);
   try {
-    if (!lastQR) {
-      return res.status(404).type('text/plain; charset=utf-8')
-        .send('QR ainda não disponível. Atualize em alguns segundos.');
-    }
-    const svg = await QRCode.toString(lastQR, { type: 'svg', errorCorrectionLevel: 'M' });
-    res.type('image/svg+xml').send(svg);
+    await bootstrap();
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    console.error('Falha ao inicializar o WhatsApp:', e);
+    process.exit(1);
   }
 });
 
-// Recria o cliente e SOLICITA CÓDIGO de pareamento para o número enviado
-app.post('/pairing-code', async (req, res) => {
-  try {
-    const raw = String(req.body?.phone || process.env.PAIRING_PHONE || '').trim();
-    const phone = raw.replace(/\D/g, '');
-    if (!/^\d{10,15}$/.test(phone)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Envie 'phone' no formato E.164 sem '+', ex.: 5511999999999"
-      });
-    }
-
-    // Prepara para capturar o próximo 'code'
-    const waitForCode = new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Timeout aguardando código (25s)')), 25_000);
-      const onceCode = (code) => {
-        clearTimeout(timeout);
-        client?.off?.('code', onceCode);
-        resolve(code);
-      };
-      client?.on?.('code', onceCode);
-    });
-
-    // Recria o cliente já pedindo código
-    try { await client?.destroy?.(); } catch (_) {}
-    createClient(phone);
-
-    // Aguarda o código
-    const code = await waitForCode;
-    lastPairingCode = code;
-    lastPairingAt = new Date();
-    return res.json({ ok: true, phone, code, at: lastPairingAt });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+// Encerramento gracioso
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM recebido. Encerrando...');
+  try { await client?.destroy(); } catch {}
+  try { await mongoClient?.close(); } catch {}
+  server.close(() => process.exit(0));
 });
-
-// Reset controlado
-app.post('/reset', async (_req, res) => {
-  try {
-    console.warn('[reset] Reinicializando cliente...');
-    if (client) {
-      try { await client.destroy(); } catch (_) {}
-    }
-    // Reinicia SEM forçar pareamento por código (use /pairing-code quando precisar)
-    createClient(null);
-    return res.json({ ok: true, message: 'Cliente reinicializado. Aguarde novo QR em /qr ou gere código em /pairing-code.' });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// Status
-app.get('/status', async (_req, res) => {
-  let state = null;
-  try { state = await client?.getState?.(); } catch (_) {}
-  res.json({
-    ok: true,
-    isReady: isReady || state === 'CONNECTED',
-    state: state || lastState || null,
-    authenticatedAt: lastAuthAt,
-    lastQRAt,
-    lastPairingCode,
-    lastPairingAt,
-    loadingScreen,
-    initializingAt
-  });
-});
-
-// Envio de mensagem
-app.post('/send-message', async (req, res) => {
-  try {
-    const { numero, message } = req.body || {};
-    if (!numero || !message) {
-      return res.status(400).json({ ok: false, error: 'Parâmetros obrigatórios: numero, message' });
-    }
-
-    let chatId = String(numero).trim();
-    const isGroup = chatId.endsWith('@g.us');
-
-    if (!isGroup) {
-      if (!chatId.endsWith('@c.us')) {
-        const digits = chatId.replace(/\D/g, '');
-        if (!/^[1-9]\d{9,14}$/.test(digits)) {
-          return res.status(400).json({
-            ok: false,
-            error: 'Formato inválido de numero. Envie em E.164: ex. 5511999999999 (DDI+DDD+número).'
-          });
-        }
-        const wid = await client.getNumberId(digits);
-        if (!wid || !wid._serialized) {
-          return res.status(404).json({ ok: false, error: 'Número não encontrado no WhatsApp (getNumberId retornou vazio).' });
-        }
-        chatId = wid._serialized;
-      }
-    }
-
-    const result = await client.sendMessage(chatId, message);
-    return res.json({
-      ok: true,
-      id: (result && result.id && (result.id._serialized || result.id.id)) || null,
-      to: chatId
-    });
-  } catch (e) {
-    if ((e?.message || '').includes('No LID for user')) {
-      return res.status(400).json({ ok: false, error: 'No LID for user: verifique o número (DDI+DDD) e se o contato tem WhatsApp.' });
-    }
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// Upload (exemplo)
-app.post('/upload',
-  fileUpload({ createParentPath: true, limits: { fileSize: 20 * 1024 * 1024 }, abortOnLimit: true }),
-  async (req, res) => {
-    if (!req.files || !req.files.file) return res.status(400).send('Nenhum arquivo recebido');
-    const myFile = req.files.file;
-    const saveDir = path.join(process.cwd(), 'uploads');
-    fs.mkdirSync(saveDir, { recursive: true });
-    const dest = path.join(saveDir, myFile.name);
-    try {
-      await myFile.mv(dest);
-      res.json({ ok: true, saved: dest });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: e.message });
-    }
-  }
-);
-
-// ----------------- HTTP server -----------------
-const server = http.createServer(app);
-server.listen(PORT, () => console.log(`App running on *: ${PORT}`));
-
-/** Shutdown gracioso: dá tempo ao RemoteAuth para flush do backup antes de sair */
-function shutdown(signal) {
-  console.log(`\n${signal} recebido. Encerrando...`);
-  server.close(() => console.log('Servidor HTTP fechado.'));
-  try { client?.destroy?.(); } catch (_) {}
-  // Espera maior p/ snapshot do RemoteAuth no Mongo
-  setTimeout(() => process.exit(0), 8000);
-}
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
