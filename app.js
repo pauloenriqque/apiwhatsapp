@@ -20,85 +20,97 @@ let lastAuthAt = null;
 let lastQR = null;
 let lastQRAt = null;
 let loadingScreen = null;
+let initializingAt = new Date();
 
-// IMPORTANTE: Não definimos executablePath (Puppeteer encontra o Chrome baixado no build)
-const client = new Client({
-  authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' /*, dataPath: '/data/.wwebjs_auth'*/ }),
-  puppeteer: {
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-zygote',
-      '--single-process',
-      '--disable-features=TranslateUI',
-      '--hide-scrollbars',
-      '--window-size=1280,800',
-      '--lang=pt-BR',
-      '--disable-quic',
-      '--ignore-certificate-errors',
-      '--ignore-certificate-errors-spki-list'
-    ]
-  }
-});
+// Cria/retorna uma instância nova do cliente (para suportar /reset)
+let client = null;
+function createClient() {
+  client = new Client({
+    authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' /*, dataPath: '/data/.wwebjs_auth'*/ }),
+    puppeteer: {
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process',
+        '--disable-features=TranslateUI',
+        '--hide-scrollbars',
+        '--window-size=1280,800',
+        '--lang=pt-BR',
+        '--disable-quic',
+        '--ignore-certificate-errors',
+        '--ignore-certificate-errors-spki-list'
+      ]
+    }
+  });
 
-// ====== Eventos detalhados p/ diagnóstico ======
-client.on('loading_screen', (percent, msg) => {
-  loadingScreen = { percent, msg, at: new Date() };
-  console.log('[loading_screen]', percent, msg);
-});
-
-client.on('qr', (qr) => {
-  lastQR = qr;
-  lastQRAt = new Date();
-  console.log('QR RECEIVED', `(at ${lastQRAt.toISOString()})`);
-  if (qrcodeTerm) qrcodeTerm.generate(qr, { small: true });
-});
-
-client.on('authenticated', () => {
-  lastAuthAt = new Date();
-  console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
+  // Zera estado
+  isReady = false;
+  lastState = null;
+  lastAuthAt = null;
   lastQR = null;
   lastQRAt = null;
-});
+  loadingScreen = null;
+  initializingAt = new Date();
 
-client.on('auth_failure', (m) => {
-  console.error('[auth_failure]', m);
-});
+  // ====== Eventos detalhados p/ diagnóstico ======
+  client.on('loading_screen', (percent, msg) => {
+    loadingScreen = { percent, msg, at: new Date() };
+    console.log('[loading_screen]', percent, msg);
+  });
 
-client.on('change_state', (state) => {
-  lastState = state;
-  console.log('[change_state]', state);
-  if (state === 'CONNECTED' && !isReady) {
-    // Marcação otimista: já estamos conectados; aguardar 'ready' não é estritamente necessário
+  client.on('qr', (qr) => {
+    lastQR = qr;
+    lastQRAt = new Date();
+    console.log('QR RECEIVED', `(at ${lastQRAt.toISOString()})`);
+    if (qrcodeTerm) qrcodeTerm.generate(qr, { small: true });
+  });
+
+  client.on('authenticated', () => {
+    lastAuthAt = new Date();
+    console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
+    // limpamos o QR armazenado para evitar expor QR antigo
+    lastQR = null;
+    lastQRAt = null;
+  });
+
+  client.on('auth_failure', (m) => {
+    console.error('[auth_failure]', m);
+  });
+
+  client.on('change_state', (state) => {
+    lastState = state;
+    console.log('[change_state]', state);
+    if (state === 'CONNECTED' && !isReady) {
+      isReady = true;
+      console.log('[state->CONNECTED] Marcando isReady=true');
+    }
+  });
+
+  client.on('ready', async () => {
     isReady = true;
-    console.log('[state->CONNECTED] Marcando isReady=true');
-  }
-});
+    console.log('₢ BOT-ZDG Dispositivo pronto');
+    try {
+      lastState = await client.getState();
+      console.log('getState() após ready:', lastState);
+    } catch (e) {
+      console.warn('getState() falhou após ready:', e?.message || String(e));
+    }
+  });
 
-client.on('ready', async () => {
-  isReady = true;
-  console.log('₢ BOT-ZDG Dispositivo pronto');
-  try {
-    lastState = await client.getState();
-    console.log('getState() após ready:', lastState);
-  } catch (e) {
-    console.warn('getState() falhou após ready:', e?.message || String(e));
-  }
-});
+  client.on('disconnected', (reason) => {
+    isReady = false;
+    console.warn('[disconnected]', reason);
+  });
 
-client.on('disconnected', (reason) => {
-  isReady = false;
-  console.warn('[disconnected]', reason);
-});
-
-// Inicia o cliente
-client.initialize();
+  client.initialize();
+}
+createClient();
 
 // ====== Polling leve de estado (a cada 3s) ======
-// Garante que, se estivermos CONNECTED mas 'ready' não tiver disparado, a home mostre 'ready'
 setInterval(async () => {
   try {
     const s = await client.getState();
@@ -122,7 +134,7 @@ const app = express();
 app.head('/', (_req, res) => res.status(200).end());
 app.get('/healthz', (_req, res) => res.json({ ok: true, isReady, lastState, loadingScreen }));
 
-// Log simples de requests (evita poluir com /healthz)
+// Log simples de requests
 app.use((req, _res, next) => {
   if (req.path !== '/healthz') {
     console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
@@ -133,7 +145,7 @@ app.use((req, _res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Home agora consulta o estado atual para refletir 'ready' assim que CONNECTED
+// Home dinâmica: considera CONNECTED como "ready"
 app.get('/', async (_req, res) => {
   let currentState = lastState;
   try { currentState = await client.getState(); } catch (_) {}
@@ -157,6 +169,20 @@ app.get('/qr', async (_req, res) => {
   }
 });
 
+// Reset controlado: derruba e reinicia o cliente (sem reiniciar o processo)
+app.post('/reset', async (_req, res) => {
+  try {
+    console.warn('[reset] Reinicializando cliente...');
+    if (client) {
+      try { await client.destroy(); } catch (_) {}
+    }
+    createClient();
+    return res.json({ ok: true, message: 'Cliente reinicializado. Aguarde o novo QR em /qr.' });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 // Status
 app.get('/status', async (_req, res) => {
   let state = null;
@@ -167,7 +193,8 @@ app.get('/status', async (_req, res) => {
     state: state || lastState || null,
     authenticatedAt: lastAuthAt,
     lastQRAt,
-    loadingScreen
+    loadingScreen,
+    initializingAt
   });
 });
 
