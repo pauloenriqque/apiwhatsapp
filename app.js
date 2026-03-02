@@ -5,7 +5,11 @@ const fileUpload = require('express-fileupload');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+
+const { Client, RemoteAuth } = require('whatsapp-web.js');
+const { MongoStore } = require('wwebjs-mongo');
+const mongoose = require('mongoose');
+
 const QRCode = require('qrcode');
 
 let qrcodeTerm = null;
@@ -22,26 +26,31 @@ let lastQRAt = null;
 let loadingScreen = null;
 let initializingAt = new Date();
 
-// Escolha um UA comum de Chrome estável em Linux.
-// (O Puppeteer já usa um UA válido, mas setar explicitamente ajuda a evitar renovações constantes de QR em alguns ambientes.)
+// User-Agent estável (ajuda em ambientes headless)
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36';
 
-// Cria/retorna uma instância nova do cliente (suporta /reset)
+// Instâncias globais
 let client = null;
+let store = null;
+
+// --------- Função que cria o Client (usada também pelo /reset) ---------
 function createClient() {
   client = new Client({
-    // IMPORTANTE: se você anexar um Disk no Render, troque para:
-    // authStrategy: new LocalAuth({ clientId: 'BOT-ZDG', dataPath: '/data/.wwebjs_auth' }),
-    authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' }),
+    // >>> PERSISTÊNCIA DE SESSÃO VIA REMOTEAUTH (MongoStore) <<<
+    authStrategy: new RemoteAuth({
+      clientId: 'BOT-ZDG',
+      store,
+      // faz backup periódico da sessão para o store remoto
+      backupSyncIntervalMs: 5 * 60 * 1000 // 5 min
+      // dataPath (local temporário) pode ficar default; no restart a sessão volta do Mongo
+    }),
 
-    // Assume a sessão em caso de conflito e reinicia se falhar autenticação
     takeoverOnConflict: true,
     takeoverTimeoutMs: 15_000,
     restartOnAuthFail: true,
 
-    // Puppeteer/headless em container
     puppeteer: {
       headless: 'new',
       args: [
@@ -58,15 +67,13 @@ function createClient() {
         '--disable-quic',
         '--ignore-certificate-errors',
         '--ignore-certificate-errors-spki-list',
-        `--user-agent=${USER_AGENT}`,
-        // (opcional) se sua rede exigir proxy, você pode setar aqui:
-        // `--proxy-server=${process.env.HTTP_PROXY}`
+        `--user-agent=${USER_AGENT}`
       ]
       // Não definimos executablePath: o Puppeteer usa o Chrome baixado no build (postinstall)
     }
   });
 
-  // Zera estado
+  // Zera/ajusta estado
   isReady = false;
   lastState = null;
   lastAuthAt = null;
@@ -75,7 +82,7 @@ function createClient() {
   loadingScreen = null;
   initializingAt = new Date();
 
-  // ====== Eventos detalhados p/ diagnóstico ======
+  // ====== Eventos ======
   client.on('loading_screen', (percent, msg) => {
     loadingScreen = { percent, msg, at: new Date() };
     console.log('[loading_screen]', percent, msg);
@@ -88,10 +95,9 @@ function createClient() {
     if (qrcodeTerm) qrcodeTerm.generate(qr, { small: true });
   });
 
-  client.on('authenticated', () => {
+  client.once('authenticated', () => {
     lastAuthAt = new Date();
     console.log('₢ BOT-ZDG Autenticado', lastAuthAt.toISOString());
-    // Limpa QR armazenado
     lastQR = null;
     lastQRAt = null;
   });
@@ -105,11 +111,11 @@ function createClient() {
     console.log('[change_state]', state);
     if (state === 'CONNECTED' && !isReady) {
       isReady = true;
-      console.log('[state->CONNECTED] Marcando isReady=true');
+      console.log('[state->CONNECTED] isReady=true');
     }
   });
 
-  client.on('ready', async () => {
+  client.once('ready', async () => {
     isReady = true;
     console.log('₢ BOT-ZDG Dispositivo pronto');
     try {
@@ -127,12 +133,27 @@ function createClient() {
 
   client.initialize();
 }
-createClient();
 
-// ====== Polling leve de estado (a cada 3s) ======
+// ====== Conexão ao Mongo e bootstrap ======
+(async () => {
+  if (!process.env.MONGODB_URI) {
+    console.error('[FALTA MONGODB_URI] Configure a env MONGODB_URI no Render.');
+  } else {
+    try {
+      await mongoose.connect(process.env.MONGODB_URI);
+      console.log('[MongoDB] conectado');
+      store = new MongoStore({ mongoose });
+      createClient();
+    } catch (e) {
+      console.error('[MongoDB] erro ao conectar:', e?.message || String(e));
+    }
+  }
+})();
+
+// ====== Polling de estado (3s) ======
 setInterval(async () => {
   try {
-    const s = await client.getState();
+    const s = await client?.getState?.();
     if (s && s !== lastState) {
       console.log('[poll:getState] mudou:', lastState, '->', s);
       lastState = s;
@@ -141,19 +162,15 @@ setInterval(async () => {
       isReady = true;
       console.log('[poll:getState] CONNECTED; isReady=true');
     }
-  } catch (_) {
-    // silencioso
-  }
+  } catch (_) {}
 }, 3000);
 
 // ----------------- Express App -----------------
 const app = express();
 
-// Health-check minimalista
 app.head('/', (_req, res) => res.status(200).end());
 app.get('/healthz', (_req, res) => res.json({ ok: true, isReady, lastState, loadingScreen }));
 
-// Log simples de requests
 app.use((req, _res, next) => {
   if (req.path !== '/healthz') {
     console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
@@ -164,17 +181,17 @@ app.use((req, _res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Home dinâmica: considera CONNECTED como "ready"
+// Home dinâmica
 app.get('/', async (_req, res) => {
   let currentState = lastState;
-  try { currentState = await client.getState(); } catch (_) {}
+  try { currentState = await client?.getState?.(); } catch (_) {}
   const readyNow = isReady || currentState === 'CONNECTED';
   res
     .type('text/plain; charset=utf-8')
     .send(`App running on *:${PORT}\nBOT-ZDG: ${readyNow ? 'ready' : 'initializing'}\n`);
 });
 
-// Exibe QR atual como SVG
+// QR em SVG
 app.get('/qr', async (_req, res) => {
   try {
     if (!lastQR) {
@@ -188,7 +205,7 @@ app.get('/qr', async (_req, res) => {
   }
 });
 
-// Reset controlado: derruba e reinicia o cliente (sem reiniciar o processo)
+// Reset controlado
 app.post('/reset', async (_req, res) => {
   try {
     console.warn('[reset] Reinicializando cliente...');
@@ -205,7 +222,7 @@ app.post('/reset', async (_req, res) => {
 // Status
 app.get('/status', async (_req, res) => {
   let state = null;
-  try { state = await client.getState(); } catch (_) {}
+  try { state = await client?.getState?.(); } catch (_) {}
   res.json({
     ok: true,
     isReady: isReady || state === 'CONNECTED',
@@ -229,9 +246,7 @@ app.post('/send-message', async (req, res) => {
     const isGroup = chatId.endsWith('@g.us');
 
     if (!isGroup) {
-      if (chatId.endsWith('@c.us')) {
-        // ok
-      } else {
+      if (!chatId.endsWith('@c.us')) {
         const digits = chatId.replace(/\D/g, '');
         if (!/^[1-9]\d{9,14}$/.test(digits)) {
           return res.status(400).json({
@@ -286,7 +301,7 @@ server.listen(PORT, () => console.log(`App running on *: ${PORT}`));
 function shutdown(signal) {
   console.log(`\n${signal} recebido. Encerrando...`);
   server.close(() => console.log('Servidor HTTP fechado.'));
-  try { client.destroy(); } catch (_) {}
+  try { client?.destroy?.(); } catch (_) {}
   setTimeout(() => process.exit(0), 500);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
