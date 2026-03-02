@@ -22,7 +22,6 @@ let lastQRAt = null;
 let loadingScreen = null;
 
 // IMPORTANTE: Não definimos executablePath (Puppeteer encontra o Chrome baixado no build)
-// Flags focadas em containers/headless (no-sandbox, shm reduzido, sem quic/zygote, etc.)
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: 'BOT-ZDG' /*, dataPath: '/data/.wwebjs_auth'*/ }),
   puppeteer: {
@@ -67,12 +66,16 @@ client.on('authenticated', () => {
 
 client.on('auth_failure', (m) => {
   console.error('[auth_failure]', m);
-  // Dica: se houver auth_failure frequente, limpe aparelhos conectados no celular e tente novo QR
 });
 
 client.on('change_state', (state) => {
   lastState = state;
   console.log('[change_state]', state);
+  if (state === 'CONNECTED' && !isReady) {
+    // Marcação otimista: já estamos conectados; aguardar 'ready' não é estritamente necessário
+    isReady = true;
+    console.log('[state->CONNECTED] Marcando isReady=true');
+  }
 });
 
 client.on('ready', async () => {
@@ -91,7 +94,26 @@ client.on('disconnected', (reason) => {
   console.warn('[disconnected]', reason);
 });
 
+// Inicia o cliente
 client.initialize();
+
+// ====== Polling leve de estado (a cada 3s) ======
+// Garante que, se estivermos CONNECTED mas 'ready' não tiver disparado, a home mostre 'ready'
+setInterval(async () => {
+  try {
+    const s = await client.getState();
+    if (s && s !== lastState) {
+      console.log('[poll:getState] mudou:', lastState, '->', s);
+      lastState = s;
+    }
+    if (s === 'CONNECTED' && !isReady) {
+      isReady = true;
+      console.log('[poll:getState] CONNECTED; isReady=true');
+    }
+  } catch (_) {
+    // silencioso
+  }
+}, 3000);
 
 // ----------------- Express App -----------------
 const app = express();
@@ -111,10 +133,14 @@ app.use((req, _res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (_req, res) => {
+// Home agora consulta o estado atual para refletir 'ready' assim que CONNECTED
+app.get('/', async (_req, res) => {
+  let currentState = lastState;
+  try { currentState = await client.getState(); } catch (_) {}
+  const readyNow = isReady || currentState === 'CONNECTED';
   res
     .type('text/plain; charset=utf-8')
-    .send(`App running on *:${PORT}\nBOT-ZDG: ${isReady ? 'ready' : 'initializing'}\n`);
+    .send(`App running on *:${PORT}\nBOT-ZDG: ${readyNow ? 'ready' : 'initializing'}\n`);
 });
 
 // Exibe QR atual como SVG
@@ -137,7 +163,7 @@ app.get('/status', async (_req, res) => {
   try { state = await client.getState(); } catch (_) {}
   res.json({
     ok: true,
-    isReady,
+    isReady: isReady || state === 'CONNECTED',
     state: state || lastState || null,
     authenticatedAt: lastAuthAt,
     lastQRAt,
